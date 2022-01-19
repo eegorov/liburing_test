@@ -46,10 +46,20 @@ struct request {
     struct iovec iov[];
 };
 
+struct my_request {
+    int event_type;
+    int client_socket;
+    int datalen;
+    int file_descriptor;
+    struct sockaddr_in client_addr;
+    char filename[256];
+    char data[READ_SZ];
+};
+
 struct io_uring ring;
 
 const char *unimplemented_content = \
-                                "HTTP/1.0 400 Bad Request\r\n"
+        "HTTP/1.0 400 Bad Request\r\n"
                                 "Content-type: text/html\r\n"
                                 "\r\n"
                                 "<html>"
@@ -63,7 +73,7 @@ const char *unimplemented_content = \
                                 "</html>";
 
 const char *http_404_content = \
-                                "HTTP/1.0 404 Not Found\r\n"
+        "HTTP/1.0 404 Not Found\r\n"
                                 "Content-type: text/html\r\n"
                                 "\r\n"
                                 "<html>"
@@ -107,13 +117,13 @@ int check_kernel_version() {
         }
     }
     printf("Minimum kernel version required is: %d.%d\n",
-            MIN_KERNEL_VERSION, MIN_MAJOR_VERSION);
+           MIN_KERNEL_VERSION, MIN_MAJOR_VERSION);
     if (ver[0] >= MIN_KERNEL_VERSION && ver[1] >= MIN_MAJOR_VERSION ) {
         printf("Your kernel version is: %ld.%ld\n", ver[0], ver[1]);
         return 0;
     }
     fprintf(stderr, "Error: your kernel version is: %ld.%ld\n",
-                    ver[0], ver[1]);
+            ver[0], ver[1]);
     return 1;
 }
 
@@ -193,7 +203,7 @@ int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
     // аналог accept
     io_uring_prep_accept(sqe, server_socket, (struct sockaddr *) client_addr,
                          client_addr_len, 0);
-    struct request *req = malloc(sizeof(*req));
+    struct my_request *req = malloc(sizeof(*req));
     req->event_type = Event_Type_NewConnection;
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(&ring);
@@ -201,16 +211,34 @@ int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
     return 0;
 }
 
-int add_read_request(int client_socket) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    struct request *req = malloc(sizeof(*req) + sizeof(struct iovec));
-    req->iov[0].iov_base = malloc(READ_SZ);
-    req->iov[0].iov_len = READ_SZ;
-    req->event_type = Event_Type_ClientSocketReadyRead;
-    req->client_socket = client_socket;
-    memset(req->iov[0].iov_base, 0, READ_SZ);
+int add_read_request(struct my_request *req, int client_socket)
+{
+    if(req == 0) // Новое подключение. Создадим новый запрос
+    {
+        struct sockaddr addr;
+        socklen_t len = sizeof(addr);
+        struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
+        int i = getpeername(client_socket, &addr, &len);
+        if (i == 0)
+        {
+            char * ip = inet_ntoa(s_addr->sin_addr);
+            uint16_t port = ntohs(s_addr->sin_port);
+            fprintf(stderr, "Waiting data from from client address: [%s:%u]\n", ip, port);
+
+            req = malloc(sizeof(*req));
+
+            req->client_socket = client_socket;
+            req->client_addr = *s_addr;
+            req->event_type = Event_Type_ClientSocketReadyRead;
+            sprintf(req->filename, "%s_%d.txt", ip, port);
+            req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT, S_IRUSR);
+
+        }
+    }
+    req->datalen = READ_SZ;
     /* Linux kernel 5.5 has support for readv, but not for recv() or read() */
-    io_uring_prep_readv(sqe, client_socket, &req->iov[0], 1, 0);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe, client_socket, req->data, req->datalen, 0);
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(&ring);
     return 0;
@@ -421,28 +449,6 @@ int get_line(const char *src, char *dest, int dest_sz) {
     return 1;
 }
 
-int handle_client_request(struct request *req) {
-
-    char filename[255];
-
-    struct sockaddr addr;
-    socklen_t len = sizeof(addr);
-    struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
-
-    int i = getpeername(req->client_socket, &addr, &len);
-
-    if(i == 0)
-    {
-        char * ip = inet_ntoa(s_addr->sin_addr);
-        uint16_t port = ntohs(s_addr->sin_port);
-        sprintf(filename, "%s_%u.txt", ip, port);
-        int fd=open(filename, O_WRONLY|O_CREAT, S_IRUSR);
-        int res = write(fd, req->iov[0].iov_base, req->iov[0].iov_len);
-        close(fd);
-    }
-    return 0;
-}
-
 void server_loop(int server_socket) {
     struct io_uring_cqe *cqe;
     struct sockaddr_in client_addr;
@@ -450,9 +456,10 @@ void server_loop(int server_socket) {
 
     add_accept_request(server_socket, &client_addr, &client_addr_len); // Создание события на подключение нового клиента
 
-    while (1) {
+    while (1)
+    {
         int ret = io_uring_wait_cqe(&ring, &cqe);
-        struct request *req = (struct request *) cqe->user_data;
+        struct my_request *req = (struct my_request *) cqe->user_data;
         if (ret < 0)
             fatal_error("io_uring_wait_cqe");
         if (cqe->res < 0) {
@@ -461,41 +468,41 @@ void server_loop(int server_socket) {
             exit(1);
         }
 
-        switch (req->event_type) {
+        switch (req->event_type)
+        {
         case Event_Type_NewConnection:
         {
             // В cqe->res лежит дискриптор подключения клиента
-            struct sockaddr addr;
-            socklen_t len = sizeof(addr);
-            struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
-            int i = getpeername(cqe->res, &addr, &len);
-            if (i == 0)
-            {
-                char * ip = inet_ntoa(s_addr->sin_addr);
-                uint16_t port = ntohs(s_addr->sin_port);
-                fprintf(stderr, "New connection (fd = %d) from client address: [%s:%u]\n", cqe->res, ip, port);
-            }
             add_accept_request(server_socket, &client_addr, &client_addr_len); // продолжим слушать
-            add_read_request(cqe->res);
+            add_read_request(0, cqe->res);
             free(req);
             break;
         }
         case Event_Type_ClientSocketReadyRead:
-            if (!cqe->res) {
-                fprintf(stderr, "Empty request!\n");
-                break;
+        {
+            int readed = cqe->res;// В cqe->res лежит число считанных байт
+            if (!readed)
+            {
+                // Сокет закрылся. Закроем файл.
+                close(req->file_descriptor);
+                free(req);
             }
-            handle_client_request(req);
-            free(req->iov[0].iov_base);
-            free(req);
+            else
+            {
+                req->datalen = cqe->res;
+                // Запишем в файл и продолжим слушать
+                int count = write(req->file_descriptor, req->data, req->datalen);
+                add_read_request(req, req->client_socket);
+            }
             break;
-        case EVENT_TYPE_WRITE:
+            /*        case EVENT_TYPE_WRITE:
             for (int i = 0; i < req->iovec_count; i++) {
                 free(req->iov[i].iov_base);
             }
             close(req->client_socket);
             free(req);
-            break;
+            break;*/
+        }
         }
         /* Mark this request as processed */
         io_uring_cqe_seen(&ring, cqe);
@@ -510,7 +517,7 @@ void sigint_handler(int signo) {
 
 int main() {
 
-   if (check_kernel_version()) {
+    if (check_kernel_version()) {
         return EXIT_FAILURE;
     }
     check_for_index_file();
@@ -521,7 +528,7 @@ int main() {
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     server_loop(server_socket);
 
- /*   int listenfd = 0, connfd = 0;
+    /*   int listenfd = 0, connfd = 0;
     struct sockaddr_in serv_addr;
 
     char sendBuff[1025];
