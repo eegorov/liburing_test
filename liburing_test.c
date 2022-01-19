@@ -10,10 +10,24 @@
 #include <fcntl.h>
 #include <sys/utsname.h>
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #define SERVER_STRING           "Server: zerohttpd/0.1\r\n"
 #define DEFAULT_SERVER_PORT     8000
 #define QUEUE_DEPTH             256
 #define READ_SZ                 8192
+
+
+enum
+{
+    Event_Type_NewConnection  = 0,
+    Event_Type_ClientSocketReadyRead,
+    Event_Type_ClientSockedWrited,
+    Event_Type_ClientSockedClosed,
+    Event_Type_FileWrited,
+}
+event_types;
 
 #define EVENT_TYPE_ACCEPT       0
 #define EVENT_TYPE_READ         1
@@ -22,10 +36,13 @@
 #define MIN_KERNEL_VERSION      5
 #define MIN_MAJOR_VERSION       5
 
+socklen_t client_addr_len = sizeof(struct sockaddr_in);
+
 struct request {
     int event_type;
     int iovec_count;
     int client_socket;
+    struct sockaddr_in client_addr;
     struct iovec iov[];
 };
 
@@ -173,10 +190,11 @@ int setup_listening_socket(int port) {
 int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
                        socklen_t *client_addr_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    // аналог accept
     io_uring_prep_accept(sqe, server_socket, (struct sockaddr *) client_addr,
                          client_addr_len, 0);
     struct request *req = malloc(sizeof(*req));
-    req->event_type = EVENT_TYPE_ACCEPT;
+    req->event_type = Event_Type_NewConnection;
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(&ring);
 
@@ -188,7 +206,7 @@ int add_read_request(int client_socket) {
     struct request *req = malloc(sizeof(*req) + sizeof(struct iovec));
     req->iov[0].iov_base = malloc(READ_SZ);
     req->iov[0].iov_len = READ_SZ;
-    req->event_type = EVENT_TYPE_READ;
+    req->event_type = Event_Type_ClientSocketReadyRead;
     req->client_socket = client_socket;
     memset(req->iov[0].iov_base, 0, READ_SZ);
     /* Linux kernel 5.5 has support for readv, but not for recv() or read() */
@@ -392,21 +410,6 @@ void handle_get_method(char *path, int client_socket) {
  * in case both these don't match. This sends an error to the client.
  * */
 
-void handle_http_method(char *method_buffer, int client_socket) {
-    char *method, *path, *saveptr;
-
-    method = strtok_r(method_buffer, " ", &saveptr);
-    strtolower(method);
-    path = strtok_r(NULL, " ", &saveptr);
-
-    if (strcmp(method, "get") == 0) {
-        handle_get_method(path, client_socket);
-    }
-    else {
-        handle_unimplemented_method(client_socket);
-    }
-}
-
 int get_line(const char *src, char *dest, int dest_sz) {
     for (int i = 0; i < dest_sz; i++) {
         dest[i] = src[i];
@@ -419,13 +422,24 @@ int get_line(const char *src, char *dest, int dest_sz) {
 }
 
 int handle_client_request(struct request *req) {
-    char http_request[1024];
-    /* Get the first line, which will be the request */
-    if(get_line(req->iov[0].iov_base, http_request, sizeof(http_request))) {
-        fprintf(stderr, "Malformed request\n");
-        exit(1);
+
+    char filename[255];
+
+    struct sockaddr addr;
+    socklen_t len = sizeof(addr);
+    struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
+
+    int i = getpeername(req->client_socket, &addr, &len);
+
+    if(i == 0)
+    {
+        char * ip = inet_ntoa(s_addr->sin_addr);
+        uint16_t port = ntohs(s_addr->sin_port);
+        sprintf(filename, "%s_%u.txt", ip, port);
+        int fd=open(filename, O_WRONLY|O_CREAT, S_IRUSR);
+        int res = write(fd, req->iov[0].iov_base, req->iov[0].iov_len);
+        close(fd);
     }
-    handle_http_method(http_request, req->client_socket);
     return 0;
 }
 
@@ -434,7 +448,7 @@ void server_loop(int server_socket) {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
-    add_accept_request(server_socket, &client_addr, &client_addr_len);
+    add_accept_request(server_socket, &client_addr, &client_addr_len); // Создание события на подключение нового клиента
 
     while (1) {
         int ret = io_uring_wait_cqe(&ring, &cqe);
@@ -448,27 +462,40 @@ void server_loop(int server_socket) {
         }
 
         switch (req->event_type) {
-            case EVENT_TYPE_ACCEPT:
-                add_accept_request(server_socket, &client_addr, &client_addr_len);
-                add_read_request(cqe->res);
-                free(req);
+        case Event_Type_NewConnection:
+        {
+            // В cqe->res лежит дискриптор подключения клиента
+            struct sockaddr addr;
+            socklen_t len = sizeof(addr);
+            struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
+            int i = getpeername(cqe->res, &addr, &len);
+            if (i == 0)
+            {
+                char * ip = inet_ntoa(s_addr->sin_addr);
+                uint16_t port = ntohs(s_addr->sin_port);
+                fprintf(stderr, "New connection (fd = %d) from client address: [%s:%u]\n", cqe->res, ip, port);
+            }
+            add_accept_request(server_socket, &client_addr, &client_addr_len); // продолжим слушать
+            add_read_request(cqe->res);
+            free(req);
+            break;
+        }
+        case Event_Type_ClientSocketReadyRead:
+            if (!cqe->res) {
+                fprintf(stderr, "Empty request!\n");
                 break;
-            case EVENT_TYPE_READ:
-                if (!cqe->res) {
-                    fprintf(stderr, "Empty request!\n");
-                    break;
-                }
-                handle_client_request(req);
-                free(req->iov[0].iov_base);
-                free(req);
-                break;
-            case EVENT_TYPE_WRITE:
-                for (int i = 0; i < req->iovec_count; i++) {
-                    free(req->iov[i].iov_base);
-                }
-                close(req->client_socket);
-                free(req);
-                break;
+            }
+            handle_client_request(req);
+            free(req->iov[0].iov_base);
+            free(req);
+            break;
+        case EVENT_TYPE_WRITE:
+            for (int i = 0; i < req->iovec_count; i++) {
+                free(req->iov[i].iov_base);
+            }
+            close(req->client_socket);
+            free(req);
+            break;
         }
         /* Mark this request as processed */
         io_uring_cqe_seen(&ring, cqe);
@@ -482,7 +509,8 @@ void sigint_handler(int signo) {
 }
 
 int main() {
-    if (check_kernel_version()) {
+
+   if (check_kernel_version()) {
         return EXIT_FAILURE;
     }
     check_for_index_file();
@@ -492,6 +520,37 @@ int main() {
     signal(SIGINT, sigint_handler);
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     server_loop(server_socket);
+
+ /*   int listenfd = 0, connfd = 0;
+    struct sockaddr_in serv_addr;
+
+    char sendBuff[1025];
+    time_t ticks;
+
+    listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&serv_addr, '0', sizeof(serv_addr));
+    memset(sendBuff, '0', sizeof(sendBuff));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(8000);
+
+    bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+
+    listen(listenfd, 10);
+
+    while(1)
+    {
+        connfd = accept(listenfd, (struct sockaddr*)NULL, NULL);
+
+        ticks = time(NULL);
+        snprintf(sendBuff, sizeof(sendBuff), "%.24s\r\n", ctime(&ticks));
+
+        write(connfd, sendBuff, strlen(sendBuff));
+
+        close(connfd);
+        sleep(1);
+    }*/
 
     return 0;
 }
