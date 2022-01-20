@@ -188,18 +188,18 @@ int add_read_request(struct my_request *req, int client_socket)
         {
             char * ip = inet_ntoa(s_addr->sin_addr);
             uint16_t port = ntohs(s_addr->sin_port);
-            fprintf(stderr, "Waiting data from from client address: [%s:%u]\n", ip, port);
             req = malloc(sizeof(*req));
             fprintf(stderr, "req = %p\n", req);
             req->client_socket = client_socket;
             req->client_addr = *s_addr;
             sprintf(req->filename, "%s_%d.txt", ip, port);
             req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT, S_IRUSR);
-
         }
     }
     req->datalen = READ_SZ;
     req->event_type = Event_Type_ClientSocketReadyRead;
+
+    fprintf(stderr, "Waiting data from from client address: [%s:%u]\n", ip, port);
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     io_uring_prep_read(sqe, client_socket, req->data, req->datalen, 0);
