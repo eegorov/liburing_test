@@ -22,6 +22,7 @@
 enum
 {
     Event_Type_NewConnection  = 0,
+    Event_Type_Timeout,
     Event_Type_ClientSocketReadyRead,
     Event_Type_ClientSockedWrited,
     Event_Type_ClientSockedClosed,
@@ -197,6 +198,37 @@ int setup_listening_socket(int port) {
     return (sock);
 }
 
+static void msec_to_ts(struct __kernel_timespec *ts, unsigned int msec)
+{
+    ts->tv_sec = msec / 1000;
+    ts->tv_nsec = (msec % 1000) * 1000000;
+}
+
+struct __kernel_timespec ts;
+int add_timeout_event(struct my_request *req)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+
+    msec_to_ts(&ts, 5000);
+    req->event_type = Event_Type_Timeout;
+
+    io_uring_prep_timeout(sqe, &ts, 0, 0);
+    io_uring_sqe_set_data(sqe, req);
+    io_uring_submit(&ring);
+    return 0;
+}
+
+int remove_timeout_event(struct my_request *req)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+
+    io_uring_prep_timeout_remove(sqe, (__u64)&ts, 0);
+    io_uring_sqe_set_data(sqe, req);
+    io_uring_submit(&ring);
+    return 0;
+}
+
+
 int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
                        socklen_t *client_addr_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -224,19 +256,18 @@ int add_read_request(struct my_request *req, int client_socket)
             char * ip = inet_ntoa(s_addr->sin_addr);
             uint16_t port = ntohs(s_addr->sin_port);
             fprintf(stderr, "Waiting data from from client address: [%s:%u]\n", ip, port);
-
             req = malloc(sizeof(*req));
-
+            fprintf(stderr, "req = %p\n", req);
             req->client_socket = client_socket;
             req->client_addr = *s_addr;
-            req->event_type = Event_Type_ClientSocketReadyRead;
             sprintf(req->filename, "%s_%d.txt", ip, port);
             req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT, S_IRUSR);
 
         }
     }
     req->datalen = READ_SZ;
-    /* Linux kernel 5.5 has support for readv, but not for recv() or read() */
+    req->event_type = Event_Type_ClientSocketReadyRead;
+
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     io_uring_prep_read(sqe, client_socket, req->data, req->datalen, 0);
     io_uring_sqe_set_data(sqe, req);
@@ -449,7 +480,9 @@ int get_line(const char *src, char *dest, int dest_sz) {
     return 1;
 }
 
-void server_loop(int server_socket) {
+void server_loop(int server_socket)
+{
+
     struct io_uring_cqe *cqe;
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -462,11 +495,17 @@ void server_loop(int server_socket) {
         struct my_request *req = (struct my_request *) cqe->user_data;
         if (ret < 0)
             fatal_error("io_uring_wait_cqe");
-        if (cqe->res < 0) {
-            fprintf(stderr, "Async request failed: %s for event: %d\n",
-                    strerror(-cqe->res), req->event_type);
-            exit(1);
-        }
+//        if (cqe->res < 0) {
+//            fprintf(stderr, "Async request failed: %s for event: %d\n",
+//                    strerror(-cqe->res), req->event_type);
+//            exit(1);
+//        }
+
+
+        printf("New event for req = %p\n", req);
+
+        if(!req)
+            continue;
 
         switch (req->event_type)
         {
@@ -481,6 +520,7 @@ void server_loop(int server_socket) {
         case Event_Type_ClientSocketReadyRead:
         {
             int readed = cqe->res;// В cqe->res лежит число считанных байт
+            printf("Readed %d bytes for req = %p\n", readed, req);
             if (!readed)
             {
                 // Сокет закрылся. Закроем файл.
@@ -490,19 +530,30 @@ void server_loop(int server_socket) {
             else
             {
                 req->datalen = cqe->res;
+                // Выставим таймаут в 5 сек для последующей записи данных в файл
+                add_timeout_event(req);
+            }
+            break;
+        }
+        case Event_Type_Timeout:
+        {
+            int result = cqe->res; // Результат работы таймера
+            printf("Timout expited for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
+            if(result == -ETIME)
+            {
                 // Запишем в файл и продолжим слушать
                 int count = write(req->file_descriptor, req->data, req->datalen);
+                count = write(req->client_socket, req->data, req->datalen);
+                remove_timeout_event(req);
+            }
+            else if(result == -2) // TODO: что такое -2  ?????
+            {
+                //
                 add_read_request(req, req->client_socket);
             }
             break;
-            /*        case EVENT_TYPE_WRITE:
-            for (int i = 0; i < req->iovec_count; i++) {
-                free(req->iov[i].iov_base);
-            }
-            close(req->client_socket);
-            free(req);
-            break;*/
         }
+
         }
         /* Mark this request as processed */
         io_uring_cqe_seen(&ring, cqe);
