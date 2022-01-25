@@ -13,29 +13,25 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#define SERVER_STRING           "Server: zerohttpd/0.1\r\n"
+#define MIN_KERNEL_VERSION      5
+#define MIN_MAJOR_VERSION       6
+
 #define DEFAULT_SERVER_PORT     8000
 #define QUEUE_DEPTH             256
 #define READ_SZ                 8192
+#define TIMEOUT                 5000
 
 
 enum
 {
     Event_Type_NewConnection  = 0,
     Event_Type_Timeout,
-    Event_Type_ClientSocketReadyRead,
+    Event_Type_ClientSocketReaded,
     Event_Type_ClientSockedWrited,
     Event_Type_ClientSockedClosed,
     Event_Type_FileWrited,
 }
 event_types;
-
-#define EVENT_TYPE_ACCEPT       0
-#define EVENT_TYPE_READ         1
-#define EVENT_TYPE_WRITE        2
-
-#define MIN_KERNEL_VERSION      5
-#define MIN_MAJOR_VERSION       6
 
 socklen_t client_addr_len = sizeof(struct sockaddr_in);
 
@@ -51,10 +47,6 @@ struct my_request {
 
 struct io_uring ring;
 
-/*
- One function that prints the system call and the error details
- and then exits with error code 1. Non-zero meaning things didn't go well.
- */
 void fatal_error(const char *syscall) {
     perror(syscall);
     exit(1);
@@ -91,11 +83,6 @@ int check_kernel_version() {
             ver[0], ver[1]);
     return 1;
 }
-
-/*
- * This function is responsible for setting up the main listening socket used by the
- * web server.
- * */
 
 int setup_listening_socket(int port) {
     int sock;
@@ -142,7 +129,7 @@ int add_timeout_event(struct my_request *req)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 
-    msec_to_ts(&ts, 5000);
+    msec_to_ts(&ts, TIMEOUT);
     req->event_type = Event_Type_Timeout;
 
     io_uring_prep_timeout(sqe, &ts, 0, 0);
@@ -165,7 +152,7 @@ int remove_timeout_event(struct my_request *req)
 int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
                        socklen_t *client_addr_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    // аналог accept
+
     io_uring_prep_accept(sqe, server_socket, (struct sockaddr *) client_addr,
                          client_addr_len, 0);
     struct my_request *req = malloc(sizeof(*req));
@@ -193,20 +180,45 @@ int add_read_request(struct my_request *req, int client_socket)
             req->client_socket = client_socket;
             req->client_addr = *s_addr;
             sprintf(req->filename, "%s_%d.txt", ip, port);
-            req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT, S_IRUSR);
+            req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR);
         }
     }
     req->datalen = READ_SZ;
-    req->event_type = Event_Type_ClientSocketReadyRead;
+    req->event_type = Event_Type_ClientSocketReaded;
 
-    fprintf(stderr, "Waiting data from from client address: [%s:%u]\n", ip, port);
+    fprintf(stderr, "Waiting data from from client address: %s\n", req->filename);
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_read(sqe, client_socket, req->data, req->datalen, 0);
+    io_uring_prep_read(sqe, req->client_socket, req->data, req->datalen, 0);
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(&ring);
     return 0;
 }
+
+int add_echo_request(struct my_request *req)
+{
+    req->event_type = Event_Type_ClientSockedWrited;
+
+    fprintf(stderr, "Write data to client: %s\n", req->filename);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_write(sqe, req->client_socket, req->data, req->datalen, 0);
+    io_uring_sqe_set_data(sqe, req);
+    io_uring_submit(&ring);
+    return 0;
+}
+
+int add_log_request(struct my_request *req)
+{
+    req->event_type = Event_Type_FileWrited;
+
+    fprintf(stderr, "Write data to log: %s\n", req->filename);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_write(sqe, req->file_descriptor, req->data, req->datalen, 0);
+    io_uring_sqe_set_data(sqe, req);
+    io_uring_submit(&ring);
+    return 0;
+}
+
 
 void server_loop(int server_socket)
 {
@@ -220,20 +232,23 @@ void server_loop(int server_socket)
     while (1)
     {
         int ret = io_uring_wait_cqe(&ring, &cqe);
-        struct my_request *req = (struct my_request *) cqe->user_data;
         if (ret < 0)
+        {
             fatal_error("io_uring_wait_cqe");
-//        if (cqe->res < 0) {
-//            fprintf(stderr, "Async request failed: %s for event: %d\n",
-//                    strerror(-cqe->res), req->event_type);
-//            exit(1);
-//        }
+            exit(1);
+        }
 
+        struct my_request *req = (struct my_request *) cqe->user_data;
 
+        printf("\n-----------------------------------------------------\n", req);
         printf("New event for req = %p\n", req);
+        printf("--\n", req);
 
         if(!req)
+        {
+            io_uring_cqe_seen(&ring, cqe);
             continue;
+        }
 
         switch (req->event_type)
         {
@@ -245,7 +260,7 @@ void server_loop(int server_socket)
             free(req);
             break;
         }
-        case Event_Type_ClientSocketReadyRead:
+        case Event_Type_ClientSocketReaded:
         {
             int readed = cqe->res;// В cqe->res лежит число считанных байт
             printf("Readed %d bytes for req = %p\n", readed, req);
@@ -266,29 +281,53 @@ void server_loop(int server_socket)
         case Event_Type_Timeout:
         {
             int result = cqe->res; // Результат работы таймера
-            printf("Timout expited for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
+            printf("Timout event for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
             if(result == -ETIME)
             {
                 // Запишем в файл и продолжим слушать
-                int count = write(req->file_descriptor, req->data, req->datalen);
-                count = write(req->client_socket, req->data, req->datalen);
                 remove_timeout_event(req);
             }
             else if(result == -2) // TODO: что такое -2  ?????
             {
-                //
-                add_read_request(req, req->client_socket);
+                // Отправим echo
+                add_echo_request(req);
             }
             break;
         }
+        case Event_Type_ClientSockedWrited:
+        {
+            int result = cqe->res; // Количество записанных в сокет байт
+            printf("For req = %p writed %d bytes from %d\n", req, result, req->datalen);
+            if(result != req->datalen)
+            {
+                // Что-то пошло не так
+                // Пока мы сюда ни разу не попадали.
+                // Но в дальнейшем нужно попробовать дозаписать данные "до победного"
+                // Пока просто проигнорируем, записав в лог только то, что удалось отправить
+                req->datalen = result;
+            }
+            add_log_request(req);
+            break;
+        }
+        case Event_Type_FileWrited:
+        {
+            // Продолжим чтение сокета
+            add_read_request(req, req->client_socket);
+        }
 
         }
-        /* Mark this request as processed */
+
         io_uring_cqe_seen(&ring, cqe);
     }
 }
 
-void sigint_handler(int signo) {
+void sigint_handler(int signo)
+{
+    if( signo == SIGHUP || signo == SIGPIPE)
+    {
+        printf("SIGNAL %d received. Ignoring...\n", signo);
+        return;
+    }
     printf("^C pressed. Shutting down.\n");
     io_uring_queue_exit(&ring);
     exit(0);
@@ -305,6 +344,8 @@ int main()
     printf("Listening on port: %d\n", DEFAULT_SERVER_PORT);
 
     signal(SIGINT, sigint_handler);
+    signal(SIGHUP, sigint_handler);
+    signal(SIGPIPE, sigint_handler);
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     server_loop(server_socket);
 
