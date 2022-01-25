@@ -24,18 +24,18 @@
 
 enum
 {
-    Event_Type_NewConnection  = 0,
-    Event_Type_Timeout,
-    Event_Type_ClientSocketReaded,
-    Event_Type_ClientSockedWrited,
-    Event_Type_ClientSockedClosed,
-    Event_Type_FileWrited,
-}
-event_types;
+    EventType_NewConnection  = 0,
+    EventType_Timeout,
+    EventType_ClientSocketReaded,
+    EventType_ClientSockedWrited,
+    EventType_ClientSockedClosed,
+    EventType_FileWrited,
+} event_types;
 
 socklen_t client_addr_len = sizeof(struct sockaddr_in);
 
-struct my_request {
+struct my_request
+{
     int event_type;
     int client_socket;
     int datalen;
@@ -47,35 +47,43 @@ struct my_request {
 
 struct io_uring ring;
 
-void fatal_error(const char *syscall) {
+void fatal_error(const char *syscall)
+{
     perror(syscall);
     exit(1);
 }
 
-int check_kernel_version() {
+int check_kernel_version()
+{
     struct utsname buffer;
     char *p;
     long ver[16];
     int i=0;
 
-    if (uname(&buffer) != 0) {
+    if (uname(&buffer) != 0)
+    {
         perror("uname");
         exit(EXIT_FAILURE);
     }
 
     p = buffer.release;
 
-    while (*p) {
-        if (isdigit(*p)) {
+    while (*p)
+    {
+        if (isdigit(*p))
+        {
             ver[i] = strtol(p, &p, 10);
             i++;
-        } else {
+        }
+        else
+        {
             p++;
         }
     }
     printf("Minimum kernel version required is: %d.%d\n",
            MIN_KERNEL_VERSION, MIN_MAJOR_VERSION);
-    if (ver[0] >= MIN_KERNEL_VERSION && ver[1] >= MIN_MAJOR_VERSION ) {
+    if (ver[0] >= MIN_KERNEL_VERSION && ver[1] >= MIN_MAJOR_VERSION )
+    {
         printf("Your kernel version is: %ld.%ld\n", ver[0], ver[1]);
         return 0;
     }
@@ -84,7 +92,8 @@ int check_kernel_version() {
     return 1;
 }
 
-int setup_listening_socket(int port) {
+int setup_listening_socket(int port)
+{
     int sock;
     struct sockaddr_in srv_addr;
 
@@ -130,7 +139,7 @@ int add_timeout_event(struct my_request *req)
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 
     msec_to_ts(&ts, TIMEOUT);
-    req->event_type = Event_Type_Timeout;
+    req->event_type = EventType_Timeout;
 
     io_uring_prep_timeout(sqe, &ts, 0, 0);
     io_uring_sqe_set_data(sqe, req);
@@ -156,35 +165,41 @@ int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
     io_uring_prep_accept(sqe, server_socket, (struct sockaddr *) client_addr,
                          client_addr_len, 0);
     struct my_request *req = malloc(sizeof(*req));
-    req->event_type = Event_Type_NewConnection;
+    req->event_type = EventType_NewConnection;
     io_uring_sqe_set_data(sqe, req);
     io_uring_submit(&ring);
 
     return 0;
 }
 
-int add_read_request(struct my_request *req, int client_socket)
+struct my_request * create_req(int client_socket)
 {
-    if(req == 0) // Новое подключение. Создадим новый запрос
-    {
-        struct sockaddr addr;
-        socklen_t len = sizeof(addr);
-        struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
-        int i = getpeername(client_socket, &addr, &len);
-        if (i == 0)
-        {
-            char * ip = inet_ntoa(s_addr->sin_addr);
-            uint16_t port = ntohs(s_addr->sin_port);
-            req = malloc(sizeof(*req));
-            fprintf(stderr, "req = %p\n", req);
-            req->client_socket = client_socket;
-            req->client_addr = *s_addr;
-            sprintf(req->filename, "%s_%d.txt", ip, port);
-            req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR);
-        }
-    }
+    struct my_request * req;
+    struct sockaddr addr;
+    socklen_t len = sizeof(addr);
+    struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
+    int i = getpeername(client_socket, &addr, &len);
+    req = malloc(sizeof(*req));
+    if(i != 0 || !req)
+        return NULL;
+
+    char * ip = inet_ntoa(s_addr->sin_addr);
+    uint16_t port = ntohs(s_addr->sin_port);
+
+    fprintf(stderr, "req = %p\n", req);
+    req->client_socket = client_socket;
+    req->client_addr = *s_addr;
+    sprintf(req->filename, "%s_%d.txt", ip, port);
+    req->file_descriptor = open(req->filename, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR);
     req->datalen = READ_SZ;
-    req->event_type = Event_Type_ClientSocketReaded;
+
+    return req;
+}
+
+int add_read_request(struct my_request *req)
+{
+    req->datalen = READ_SZ;
+    req->event_type = EventType_ClientSocketReaded;
 
     fprintf(stderr, "Waiting data from from client address: %s\n", req->filename);
 
@@ -197,7 +212,7 @@ int add_read_request(struct my_request *req, int client_socket)
 
 int add_echo_request(struct my_request *req)
 {
-    req->event_type = Event_Type_ClientSockedWrited;
+    req->event_type = EventType_ClientSockedWrited;
 
     fprintf(stderr, "Write data to client: %s\n", req->filename);
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -209,7 +224,7 @@ int add_echo_request(struct my_request *req)
 
 int add_log_request(struct my_request *req)
 {
-    req->event_type = Event_Type_FileWrited;
+    req->event_type = EventType_FileWrited;
 
     fprintf(stderr, "Write data to log: %s\n", req->filename);
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -252,15 +267,23 @@ void server_loop(int server_socket)
 
         switch (req->event_type)
         {
-        case Event_Type_NewConnection:
+        case EventType_NewConnection:
         {
             // В cqe->res лежит дискриптор подключения клиента
             add_accept_request(server_socket, &client_addr, &client_addr_len); // продолжим слушать
-            add_read_request(0, cqe->res);
             free(req);
+            struct my_request * socket_req = create_req(cqe->res);
+            if(socket_req)
+            {
+                add_read_request(req);
+            }
+            else
+            {
+                fatal_error("Can not allocate memory for request");
+            }
             break;
         }
-        case Event_Type_ClientSocketReaded:
+        case EventType_ClientSocketReaded:
         {
             int readed = cqe->res;// В cqe->res лежит число считанных байт
             printf("Readed %d bytes for req = %p\n", readed, req);
@@ -278,7 +301,7 @@ void server_loop(int server_socket)
             }
             break;
         }
-        case Event_Type_Timeout:
+        case EventType_Timeout:
         {
             int result = cqe->res; // Результат работы таймера
             printf("Timeout event for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
@@ -290,7 +313,7 @@ void server_loop(int server_socket)
             }
             break;
         }
-        case Event_Type_ClientSockedWrited:
+        case EventType_ClientSockedWrited:
         {
             int result = cqe->res; // Количество записанных в сокет байт
             printf("For req = %p writed %d bytes from %d\n", req, result, req->datalen);
@@ -305,12 +328,12 @@ void server_loop(int server_socket)
             add_log_request(req);
             break;
         }
-        case Event_Type_FileWrited:
+        case EventType_FileWrited:
         {
             // Продолжим чтение сокета
-            add_read_request(req, req->client_socket);
+            add_read_request(req);
         }
-
+        default: break;
         }
 
         io_uring_cqe_seen(&ring, cqe);
