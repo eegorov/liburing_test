@@ -200,6 +200,16 @@ struct my_request * create_req(int client_socket)
     return req;
 }
 
+int destroy_req(struct my_request * req)
+{
+    if(req->client_socket)
+        close(req->client_socket);
+    if(req->file_descriptor)
+        close(req->file_descriptor);
+    if(req)
+        free(req);
+}
+
 int add_read_request(struct my_request *req)
 {
     req->datalen = READ_SZ;
@@ -294,8 +304,7 @@ void server_loop(int server_socket)
             if (!readed)
             {
                 // Сокет закрылся. Закроем файл.
-                close(req->file_descriptor);
-                free(req);
+                destroy_req(req);
             }
             else
             {
@@ -312,7 +321,6 @@ void server_loop(int server_socket)
             if(result == -ETIME)
             {
                 // Запишем в файл и продолжим слушать
-                //remove_timeout_event(req);
                 add_echo_request(req);
             }
             break;
@@ -321,15 +329,23 @@ void server_loop(int server_socket)
         {
             int result = cqe->res; // Количество записанных в сокет байт
             printf("For req = %p writed %d bytes from %d\n", req, result, req->datalen);
-            if(result != req->datalen)
+            if(result < 0)
             {
-                // Что-то пошло не так
-                // Пока мы сюда ни разу не попадали.
-                // Но в дальнейшем нужно попробовать дозаписать данные "до победного"
-                // Пока просто проигнорируем, записав в лог только то, что удалось отправить
-                req->datalen = result;
+                // Ошибка записи в сокет. Закрываем сокет.
+                destroy_req(req);
             }
-            add_log_request(req);
+            else
+            {
+                if(result != req->datalen)
+                {
+                    // Что-то пошло не так
+                    // Пока мы сюда ни разу не попадали.
+                    // Но в дальнейшем нужно попробовать дозаписать данные "до победного"
+                    // Пока просто проигнорируем, записав в лог только то, что удалось отправить
+                    req->datalen = result;
+                }
+                add_log_request(req);
+            }
             break;
         }
         case EventType_FileWrited:
