@@ -179,8 +179,12 @@ struct my_request * create_req(int client_socket)
     socklen_t len = sizeof(addr);
     struct sockaddr_in * s_addr = (struct sockaddr_in *)&addr;
     int i = getpeername(client_socket, &addr, &len);
+
+    if(i != 0)
+        return NULL;
+
     req = malloc(sizeof(*req));
-    if(i != 0 || !req)
+    if(!req)
         return NULL;
 
     char * ip = inet_ntoa(s_addr->sin_addr);
