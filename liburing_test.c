@@ -281,15 +281,11 @@ void server_loop(int server_socket)
         case Event_Type_Timeout:
         {
             int result = cqe->res; // Результат работы таймера
-            printf("Timout event for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
+            printf("Timeout event for req = %p. result = %d, -ETIME = %d\n", req, result, -ETIME);
             if(result == -ETIME)
             {
                 // Запишем в файл и продолжим слушать
-                remove_timeout_event(req);
-            }
-            else if(result == -2) // TODO: что такое -2  ?????
-            {
-                // Отправим echo
+                //remove_timeout_event(req);
                 add_echo_request(req);
             }
             break;
