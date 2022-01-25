@@ -18,7 +18,7 @@
 
 #define DEFAULT_SERVER_PORT     8000
 #define QUEUE_DEPTH             256
-#define READ_SZ                 8192
+#define READ_SZ                 16*1024
 #define TIMEOUT                 5000
 
 
